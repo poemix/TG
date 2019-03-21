@@ -1,3 +1,4 @@
+import numpy as np
 import tensorflow as tf
 from tensorflow.python.framework import ops
 
@@ -15,7 +16,8 @@ class batch_norm(object):
 
 
 def binary_cross_entropy(preds, targets, name=None):
-    """Computes binary cross entropy given `preds`.
+    """
+    Computes binary cross entropy given `preds`.
 
     For brevity, let `x = `, `z = targets`.  The logistic loss is
 
@@ -93,13 +95,14 @@ def linear(input_, output_size, scope=None, stddev=0.02, bias_start=0.0, with_w=
 def gen_anchors_op(scales, ratios, feature_shape, feature_stride, anchor_stride):
     """
     scales: 1D array of anchor sizes in pixels. Example: [32, 64, 128]
-    ratio: 2D array of anchor ratios of width/height. Example: [[0.5], [0.9]]  shape:[N, 1]
+    ratios: 2D array of anchor ratios of width/height. Example: [[0.5], [0.9]]  shape:[N, 1]
     fm_shape: [height, width] spatial shape of the feature map over which
             to generate anchors.
     feature_stride: Stride of the feature map relative to the image in pixels.
     anchor_stride: Stride of anchors on the feature map. For example, if the
         value is 2 then generate anchors for every other feature map pixel.
     """
+    print(feature_stride)
     feature_shape = tf.convert_to_tensor(feature_shape)
 
     scales = tf.convert_to_tensor(scales)
@@ -108,6 +111,7 @@ def gen_anchors_op(scales, ratios, feature_shape, feature_stride, anchor_stride)
 
     ratios = tf.convert_to_tensor(ratios)
     batch_size = tf.shape(ratios)[0]
+    num_ratios = tf.shape(ratios[0])[0]
 
     # Get all combinations of scales and ratios
     scales, ratios = tf.meshgrid(scales, ratios)
@@ -121,6 +125,7 @@ def gen_anchors_op(scales, ratios, feature_shape, feature_stride, anchor_stride)
     # Enumerate shifts in feature space
     shifts_y = tf.range(0, feature_shape[0], anchor_stride) * feature_stride
     shifts_x = tf.range(0, feature_shape[1], anchor_stride) * feature_stride
+    print(feature_stride)
     shifts_y = tf.cast(shifts_y, tf.float32)
     shifts_x = tf.cast(shifts_x, tf.float32)
     shifts_x, shifts_y = tf.meshgrid(shifts_x, shifts_y)
@@ -137,7 +142,7 @@ def gen_anchors_op(scales, ratios, feature_shape, feature_stride, anchor_stride)
 
     # Convert to corner coordinates (y1, x1, y2, x2)
     boxes = tf.concat([box_centers - 0.5 * box_sizes, box_centers + 0.5 * box_sizes], axis=1)
-    boxes = tf.reshape(boxes, tf.stack([feature_shape[0], feature_shape[1], batch_size, num_scales, 4]))
+    boxes = tf.reshape(boxes, tf.stack([feature_shape[0], feature_shape[1], batch_size, num_ratios * num_scales, 4]))
     boxes = tf.transpose(boxes, [2, 0, 1, 3, 4])
 
     return boxes
@@ -209,16 +214,183 @@ def norm_boxes_op(boxes, shape):
     return tf.divide(boxes - shift, scale)
 
 
+def denorm_boxes_op(boxes, shape):
+    """
+    Converts boxes from normalized coordinates to pixel coordinates.
+    boxes: [..., (y1, x1, y2, x2)] in normalized coordinates
+    shape: [..., (height, width)] in pixels
+    Note: In pixel coordinates (y2, x2) is outside the box. But in normalized
+    coordinates it's inside the box.
+    Returns:
+        [..., (y1, x1, y2, x2)] in pixel coordinates
+    """
+    h, w = tf.split(tf.cast(shape, tf.float32), 2)
+    scale = tf.concat([h, w, h, w], axis=-1) - tf.constant(1.0)
+    shift = tf.constant([0., 0., 1., 1.])
+    return tf.cast(tf.round(tf.multiply(boxes, scale) + shift), tf.int32)
+
+
+def box_refinement_op(box, gt_box):
+    """
+    Compute refinement needed to transform box to gt_box.
+    box and gt_box are [N, (y1, x1, y2, x2)]
+    """
+    box = tf.cast(box, tf.float32)
+    gt_box = tf.cast(gt_box, tf.float32)
+
+    height = box[:, 2] - box[:, 0]
+    width = box[:, 3] - box[:, 1]
+    center_y = box[:, 0] + 0.5 * height
+    center_x = box[:, 1] + 0.5 * width
+
+    gt_height = gt_box[:, 2] - gt_box[:, 0]
+    gt_width = gt_box[:, 3] - gt_box[:, 1]
+    gt_center_y = gt_box[:, 0] + 0.5 * gt_height
+    gt_center_x = gt_box[:, 1] + 0.5 * gt_width
+
+    dy = (gt_center_y - center_y) / height
+    dx = (gt_center_x - center_x) / width
+    dh = tf.log(gt_height / height)
+    dw = tf.log(gt_width / width)
+
+    result = tf.stack([dy, dx, dh, dw], axis=1)
+    return result
+
+
+def smooth_l1_loss_op(y_true, y_pred):
+    """
+    Implements Smooth-L1 loss.
+    y_true and y_pred are typically: [N, 4], but could be any shape.
+    """
+    diff = tf.abs(y_true - y_pred)
+    less_than_one = tf.cast(tf.less(diff, 1.0), "float32")
+    loss = (less_than_one * 0.5 * diff ** 2) + (1 - less_than_one) * (diff - 0.5)
+    return loss
+
+
+def batch_pack_op(x, counts, num_rows):
+    """
+    Picks different number of values from each row
+    in x depending on the values in counts.
+    """
+    outputs = []
+    for i in range(num_rows):
+        outputs.append(x[i, :counts[i]])
+    return tf.concat(outputs, axis=0)
+
+
+def rpn_bbox_loss_op(target_bbox, rpn_match, rpn_bbox):
+    """
+    Return the RPN bounding box loss graph.
+    target_bbox: [batch, max positive anchors, (dy, dx, log(dh), log(dw))].
+        Uses 0 padding to fill in unsed bbox deltas.
+    rpn_match: [batch, anchors, 1]. Anchor match type. 1=positive,
+               -1=negative, 0=neutral anchor.
+    rpn_bbox: [batch, anchors, (dy, dx, log(dh), log(dw))]
+    """
+    # Positive anchors contribute to the loss, but negative and
+    # neutral anchors (match value of 0 or -1) don't.
+    rpn_match = tf.squeeze(rpn_match, -1)  # rpn_match: [batch, anchors]
+    indices = tf.where(tf.equal(rpn_match, 1))
+
+    # Pick bbox deltas that contribute to the loss
+    rpn_bbox = tf.gather_nd(rpn_bbox, indices)
+
+    target_bbox = tf.gather_nd(target_bbox, indices)
+
+    # # Trim target bounding box deltas to the same length as rpn_bbox.
+    # batch_counts = tf.reduce_sum(tf.cast(tf.equal(rpn_match, 1), tf.int32), axis=1)  # batch_counts: [batch]
+    #
+    # target_bbox = batch_pack_op(target_bbox, batch_counts)
+
+    loss = smooth_l1_loss_op(target_bbox, rpn_bbox)
+
+    loss = tf.cond(tf.size(loss) > 0, lambda: tf.reduce_mean(loss), lambda: tf.constant(0.0))
+    return loss
+
+
+def rpn_class_loss_op(rpn_match, rpn_class_logits):
+    """
+    RPN anchor classifier loss.
+    rpn_match: [batch, anchors, 1]. Anchor match type. 1=positive,
+               -1=negative, 0=neutral anchor.
+    rpn_class_logits: [batch, anchors, 2]. RPN classifier logits for BG/FG.
+    """
+    # Squeeze last dim to simplify
+    rpn_match = tf.squeeze(rpn_match, -1)
+    # Get anchor classes. Convert the -1/+1 match to 0/1 values.
+    anchor_class = tf.cast(tf.equal(rpn_match, 1), tf.int32)
+    # Positive and Negative anchors contribute to the loss,
+    # but neutral anchors (match value = 0) don't.
+    indices = tf.where(tf.not_equal(rpn_match, 0))
+    # Pick rows that contribute to the loss and filter out the rest.
+    rpn_class_logits = tf.gather_nd(rpn_class_logits, indices)
+    anchor_class = tf.gather_nd(anchor_class, indices)  # anchor_class: [num_pos+num_neg]
+    # Cross entropy loss
+    loss = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=anchor_class, logits=rpn_class_logits)
+    loss = tf.cond(tf.size(loss) > 0, lambda: tf.reduce_mean(loss), lambda: tf.constant(0.0))
+    return loss
+
+
+def rpn_match_op():
+    pass
+
+
+def generate_anchors(scales, ratios, shape, feature_stride, anchor_stride):
+    """
+    scales: 1D array of anchor sizes in pixels. Example: [32, 64, 128]
+    ratios: 1D array of anchor ratios of width/height. Example: [0.5, 1, 2]
+    shape: [height, width] spatial shape of the feature map over which
+            to generate anchors.
+    feature_stride: Stride of the feature map relative to the image in pixels.
+    anchor_stride: Stride of anchors on the feature map. For example, if the
+        value is 2 then generate anchors for every other feature map pixel.
+    """
+    # Get all combinations of scales and ratios
+    scales, ratios = np.meshgrid(np.array(scales), np.array(ratios))
+    scales = scales.flatten()
+    ratios = ratios.flatten()
+
+    # Enumerate heights and widths from scales and ratios
+    heights = scales / np.sqrt(ratios)
+    widths = scales * np.sqrt(ratios)
+
+    # Enumerate shifts in feature space
+    shifts_y = np.arange(0, shape[0], anchor_stride) * feature_stride
+    shifts_x = np.arange(0, shape[1], anchor_stride) * feature_stride
+    shifts_x, shifts_y = np.meshgrid(shifts_x, shifts_y)
+
+    # Enumerate combinations of shifts, widths, and heights
+    box_widths, box_centers_x = np.meshgrid(widths, shifts_x)
+    box_heights, box_centers_y = np.meshgrid(heights, shifts_y)
+
+    # Reshape to get a list of (y, x) and a list of (h, w)
+    box_centers = np.stack(
+        [box_centers_y, box_centers_x], axis=2).reshape([-1, 2])
+    box_sizes = np.stack([box_heights, box_widths], axis=2).reshape([-1, 2])
+
+    # Convert to corner coordinates (y1, x1, y2, x2)
+    boxes = np.concatenate([box_centers - 0.5 * box_sizes,
+                            box_centers + 0.5 * box_sizes], axis=1)
+    return boxes
+
+
 if __name__ == '__main__':
     with tf.Session() as sess:
-        boxes = gen_anchors_op([128, 256], [[0.5], [0.5], [0.9]], [14, 14], 32, 1)
+        boxes = gen_anchors_op([128, 256, 512], [[0.5, 1., 2]], [60, 40], 1, 1)
         result = sess.run(boxes)
         print(result.shape)
-        print(333, result[0][0][0][0])
-        print(444, result[0][0][1][0])
+        print(result[0][0][0])
 
-        print(256, result[0][0][0][1])
-        print(256, result[0][0][1][1])
+        re2 = generate_anchors([128, 256, 512], [0.5, 1., 2], [60, 40], 16, 1)
+        print(re2.reshape([-1, 60, 40, 9, 4])[0][0][0])
 
-        print(333, result[1][0][0][0])
-        print(444, result[1][0][1][0])
+# [[ -84.  -40.   99.   55.]
+# [-176.  -88.  191.  103.]
+# [-360. -184.  375.  199.]
+# [ -56.  -56.   71.   71.]
+# [-120. -120.  135.  135.]
+# [-248. -248.  263.  263.]
+# [ -36.  -80.   51.   95.]
+# [ -80. -168.   95.  183.]
+# [-168. -344.  183.  359.]]

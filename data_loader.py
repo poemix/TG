@@ -123,12 +123,18 @@ class TXTLoader(object):
 
 
 if __name__ == '__main__':
+    import os
+    import sys
+
+    os.environ["CUDA_VISIBLE_DEVICES"] = "3"  # 指定GPU
+    sys.path.append("/home/shizai/xushiqi/projects/tg/")
+
     dataloader = TXTLoader(root='/Users/aiyoj/Downloads/Thumbnail Data Set/PQ_Set',
                            txt_path='./data/train_set.txt',
                            batch_size=1,
                            shuffle=False)
-    for i in range(1):
+    for i in range(10):
         image_batch, gt_bbox_batch, thumbnail_dim_batch, ratio_batch, meta_batch, name_batch = dataloader.batch()
         print(gt_bbox_batch.shape)
         print(thumbnail_dim_batch.shape)
-        print(ratio_batch.shape)
+        print(ratio_batch, name_batch, gt_bbox_batch, meta_batch)
