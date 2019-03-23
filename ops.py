@@ -92,18 +92,20 @@ def linear(input_, output_size, scope=None, stddev=0.02, bias_start=0.0, with_w=
             return tf.matmul(input_, matrix) + bias
 
 
-def gen_anchors_op(scales, ratios, feature_shape, feature_stride, anchor_stride):
+def gen_anchors_op(scales, ratios, spatial_shape, feature_stride, anchor_stride):
     """
     scales: 1D array of anchor sizes in pixels. Example: [32, 64, 128]
-    ratios: 2D array of anchor ratios of width/height. Example: [[0.5], [0.9]]  shape:[N, 1]
-    fm_shape: [height, width] spatial shape of the feature map over which
+    ratios: 2D array of anchor ratios of width/height. Example: [[0.5], [0.9]]  shape:[batch, 1]
+    spatial_shape: [height, width] spatial shape of the feature map over which
             to generate anchors.
     feature_stride: Stride of the feature map relative to the image in pixels.
     anchor_stride: Stride of anchors on the feature map. For example, if the
         value is 2 then generate anchors for every other feature map pixel.
+
+    Returns:
+        anchors: [batch, height, width, num_scales, 4]
     """
-    print(feature_stride)
-    feature_shape = tf.convert_to_tensor(feature_shape)
+    spatial_shape = tf.convert_to_tensor(spatial_shape)
 
     scales = tf.convert_to_tensor(scales)
     scales = tf.cast(scales, tf.float32)
@@ -115,17 +117,17 @@ def gen_anchors_op(scales, ratios, feature_shape, feature_stride, anchor_stride)
 
     # Get all combinations of scales and ratios
     scales, ratios = tf.meshgrid(scales, ratios)
-    # scales:[batch_size, num_scales], ratios:[batch_size, num_scales]
+    # scales:[batch, num_scales], ratios:[batch, num_scales]
 
     # Enumerate heights and widths from scales and ratios
     heights = scales / tf.sqrt(ratios)
     widths = scales * tf.sqrt(ratios)
-    # heights:[batch_size, num_scales], widths:[batch_size, num_scales]
+    # heights:[batch, num_scales], widths:[batch, num_scales]
 
     # Enumerate shifts in feature space
-    shifts_y = tf.range(0, feature_shape[0], anchor_stride) * feature_stride
-    shifts_x = tf.range(0, feature_shape[1], anchor_stride) * feature_stride
-    print(feature_stride)
+    shifts_y = tf.range(0, spatial_shape[0], anchor_stride) * feature_stride
+    shifts_x = tf.range(0, spatial_shape[1], anchor_stride) * feature_stride
+
     shifts_y = tf.cast(shifts_y, tf.float32)
     shifts_x = tf.cast(shifts_x, tf.float32)
     shifts_x, shifts_y = tf.meshgrid(shifts_x, shifts_y)
@@ -142,13 +144,13 @@ def gen_anchors_op(scales, ratios, feature_shape, feature_stride, anchor_stride)
 
     # Convert to corner coordinates (y1, x1, y2, x2)
     boxes = tf.concat([box_centers - 0.5 * box_sizes, box_centers + 0.5 * box_sizes], axis=1)
-    boxes = tf.reshape(boxes, tf.stack([feature_shape[0], feature_shape[1], batch_size, num_ratios * num_scales, 4]))
+    boxes = tf.reshape(boxes, tf.stack([spatial_shape[0], spatial_shape[1], batch_size, num_ratios * num_scales, 4]))
     boxes = tf.transpose(boxes, [2, 0, 1, 3, 4])
 
     return boxes
 
 
-def clip_boxes_op(boxes, window):
+def clip_bbox_op(boxes, window):
     """
     boxes: [N, 4] each row is y1, x1, y2, x2
     window: [4] in the form y1, x1, y2, x2
@@ -164,6 +166,47 @@ def clip_boxes_op(boxes, window):
     x2 = tf.maximum(tf.minimum(x2, wx2), wx1)
     clipped = tf.concat([y1, x1, y2, x2], axis=1, name="clipped_boxes")
     return clipped
+
+
+def batch_overlaps_op(boxes1, boxes2):
+    """
+
+    Computes IoU overlaps between two sets of boxes.
+    boxes1, boxes2: [batch, N, (y1, x1, y2, x2)].
+
+    :param boxes1: [batch, num_anchors, 4]
+    :param boxes2: [batch, num_boxes, 4]
+    :return: [batch, num_anchors, num_boxes]
+    """
+
+    assert_op = tf.assert_equal(tf.shape(boxes1)[0], tf.shape(boxes2)[0])
+    with tf.control_dependencies([assert_op]):
+        # 1. Tile boxes2 and repeate boxes1. This allows us to compare
+        # every boxes1 against every boxes2 without loops.
+        batch = tf.shape(boxes1)[0]
+        num_boxes1 = tf.shape(boxes1)[1]
+        num_boxes2 = tf.shape(boxes2)[1]
+        b1 = tf.reshape(tf.tile(boxes1, [1, num_boxes2, 1]), [-1, 4])
+        b2 = tf.reshape(tf.tile(boxes2, [1, num_boxes1, 1]), [-1, 4])
+
+        # 2. Compute intersections
+        b1_y1, b1_x1, b1_y2, b1_x2 = tf.split(b1, 4, axis=1)
+        b2_y1, b2_x1, b2_y2, b2_x2 = tf.split(b2, 4, axis=1)
+        y1 = tf.maximum(b1_y1, b2_y1)
+        x1 = tf.maximum(b1_x1, b2_x1)
+        y2 = tf.minimum(b1_y2, b2_y2)
+        x2 = tf.minimum(b1_x2, b2_x2)
+        intersection = tf.maximum(x2 - x1, 0) * tf.maximum(y2 - y1, 0)
+
+        # 3. Compute unions
+        b1_area = (b1_y2 - b1_y1) * (b1_x2 - b1_x1)
+        b2_area = (b2_y2 - b2_y1) * (b2_x2 - b2_x1)
+        union = b1_area + b2_area - intersection
+
+        # 4. Compute IoU and reshape to [boxes1, boxes2]
+        iou = intersection / union
+        overlaps = tf.reshape(iou, [batch, num_boxes1, num_boxes2])
+    return overlaps
 
 
 def overlaps_op(boxes1, boxes2):
@@ -196,7 +239,7 @@ def overlaps_op(boxes1, boxes2):
     return overlaps
 
 
-def norm_boxes_op(boxes, shape):
+def norm_bbox_op(boxes, shape):
     """
     Converts boxes from pixel coordinates to normalized coordinates.
     boxes: [..., (y1, x1, y2, x2)] in pixel coordinates
@@ -214,7 +257,7 @@ def norm_boxes_op(boxes, shape):
     return tf.divide(boxes - shift, scale)
 
 
-def denorm_boxes_op(boxes, shape):
+def denorm_bboxes_op(boxes, shape):
     """
     Converts boxes from normalized coordinates to pixel coordinates.
     boxes: [..., (y1, x1, y2, x2)] in normalized coordinates
@@ -230,7 +273,7 @@ def denorm_boxes_op(boxes, shape):
     return tf.cast(tf.round(tf.multiply(boxes, scale) + shift), tf.int32)
 
 
-def box_refinement_op(box, gt_box):
+def bbox_refinement_op(box, gt_box):
     """
     Compute refinement needed to transform box to gt_box.
     box and gt_box are [N, (y1, x1, y2, x2)]
@@ -238,22 +281,31 @@ def box_refinement_op(box, gt_box):
     box = tf.cast(box, tf.float32)
     gt_box = tf.cast(gt_box, tf.float32)
 
+    # Convert coordinates(坐标) to center plus width/height.
+    # anchor
     height = box[:, 2] - box[:, 0]
     width = box[:, 3] - box[:, 1]
     center_y = box[:, 0] + 0.5 * height
     center_x = box[:, 1] + 0.5 * width
 
+    # gt box
     gt_height = gt_box[:, 2] - gt_box[:, 0]
     gt_width = gt_box[:, 3] - gt_box[:, 1]
     gt_center_y = gt_box[:, 0] + 0.5 * gt_height
     gt_center_x = gt_box[:, 1] + 0.5 * gt_width
 
+    # Compute the bbox refinement that the RPN should predict.
     dy = (gt_center_y - center_y) / height
     dx = (gt_center_x - center_x) / width
     dh = tf.log(gt_height / height)
     dw = tf.log(gt_width / width)
 
     result = tf.stack([dy, dx, dh, dw], axis=1)
+
+    # Normalize
+    bbox_std_dev = tf.constant([0.1, 0.1, 0.2, 0.2], dtype=tf.float32)
+    result = result / bbox_std_dev
+
     return result
 
 
@@ -297,6 +349,7 @@ def rpn_bbox_loss_op(target_bbox, rpn_match, rpn_bbox):
     rpn_bbox = tf.gather_nd(rpn_bbox, indices)
 
     target_bbox = tf.gather_nd(target_bbox, indices)
+    print(111, target_bbox)
 
     # # Trim target bounding box deltas to the same length as rpn_bbox.
     # batch_counts = tf.reduce_sum(tf.cast(tf.equal(rpn_match, 1), tf.int32), axis=1)  # batch_counts: [batch]
@@ -332,8 +385,19 @@ def rpn_class_loss_op(rpn_match, rpn_class_logits):
     return loss
 
 
-def rpn_match_op():
-    pass
+def rpn_match_op(num_anchors, pos_indices, neg_indices):
+    def py_rpn_match(num_anchors_, pos_indices_, neg_indices_):
+        # pos:1(iou>0.7)  neu:0(0.7>iou>0.3)  neg:-1(iou<0.3)
+        rpn_match = np.zeros([num_anchors_], dtype=np.int32)
+        rpn_match[pos_indices_] = 1
+        rpn_match[neg_indices_] = -1
+        return rpn_match
+
+    match = tf.py_func(
+        py_rpn_match,
+        [num_anchors, pos_indices, neg_indices],
+        tf.int32)
+    return match
 
 
 def generate_anchors(scales, ratios, shape, feature_stride, anchor_stride):
@@ -375,15 +439,137 @@ def generate_anchors(scales, ratios, shape, feature_stride, anchor_stride):
     return boxes
 
 
-if __name__ == '__main__':
-    with tf.Session() as sess:
-        boxes = gen_anchors_op([128, 256, 512], [[0.5, 1., 2]], [60, 40], 1, 1)
-        result = sess.run(boxes)
-        print(result.shape)
-        print(result[0][0][0])
+def trim_zeros_op(boxes, name='trim_zeros'):
+    """
+    Often boxes are represented with matrices of shape [N, 4] and
+    are padded with zeros. This removes zero boxes.
+    boxes: [N, 4] matrix of boxes.
+    non_zeros: [N] a 1D boolean mask identifying the rows to keep
+    """
+    non_zeros = tf.cast(tf.reduce_sum(tf.abs(boxes), axis=1), tf.bool)
+    boxes = tf.boolean_mask(boxes, non_zeros, name=name)
+    return boxes, non_zeros
 
-        re2 = generate_anchors([128, 256, 512], [0.5, 1., 2], [60, 40], 16, 1)
-        print(re2.reshape([-1, 60, 40, 9, 4])[0][0][0])
+
+def apply_box_deltas_op(boxes, deltas):
+    """
+    Applies the given deltas to the given boxes.
+    boxes: [N, (y1, x1, y2, x2)] boxes to update
+    deltas: [N, (dy, dx, log(dh), log(dw))] refinements to apply
+    """
+    # Convert to y, x, h, w
+    height = boxes[:, 2] - boxes[:, 0]
+    width = boxes[:, 3] - boxes[:, 1]
+    center_y = boxes[:, 0] + 0.5 * height
+    center_x = boxes[:, 1] + 0.5 * width
+    # Apply deltas
+    center_y += deltas[:, 0] * height
+    center_x += deltas[:, 1] * width
+    height *= tf.exp(deltas[:, 2])
+    width *= tf.exp(deltas[:, 3])
+    # Convert back to y1, x1, y2, x2
+    y1 = center_y - 0.5 * height
+    x1 = center_x - 0.5 * width
+    y2 = y1 + height
+    x2 = x1 + width
+    result = tf.stack([y1, x1, y2, x2], axis=1, name="apply_box_deltas_out")
+
+
+def build_rpn_targets(anchors, gt_bboxes):
+    """
+    Given the anchors and GT boxes, compute overlaps and identify positive
+    anchors and deltas to refine them to match their corresponding GT boxes.
+
+    :param anchors: [batch, num_anchors, (y1, x1, y2, x2)]
+    :param gt_bboxes: [batch, num_gt_boxes, (y1, x1, y2, x2)]
+
+    :return: rpn_match: [N] (int32) matches between anchors and GT boxes.
+               1 = positive anchor, -1 = negative anchor, 0 = neutral
+             rpn_bbox: [N, (dy, dx, log(dh), log(dw))] Anchor bbox deltas.
+    """
+    num_anchors = tf.shape(anchors)[1]
+    num_bboxes = tf.shape(gt_bboxes)[0]
+    overlaps = batch_overlaps_op(anchors, gt_bboxes)
+    iou_argmax = tf.argmax(overlaps, axis=2, output_type=tf.int32)  # iou_argmax: [b, num_anchors]
+    iou_argmax_ = tf.reshape(iou_argmax, [-1])
+    indices = tf.stack([tf.range(b * num_anchors), iou_argmax_], axis=1)
+    iou_max_ = tf.gather_nd(tf.reshape(overlaps, [-1, num_bboxes]), indices)
+    iou_max = tf.reshape(iou_max_, [b, num_anchors])  # iuo_max: [b, num_anchors]
+
+
+def rpn_target_bbox_op(box, gt_box):
+    """
+    Compute refinement needed to transform box to gt_box.
+    box and gt_box are [N, (y1, x1, y2, x2)]
+    """
+    box = tf.cast(box, tf.float32)
+    gt_box = tf.cast(gt_box, tf.float32)
+
+    # Convert coordinates(坐标) to center plus width/height.
+    # anchor
+    height = box[:, 2] - box[:, 0]
+    width = box[:, 3] - box[:, 1]
+    center_y = box[:, 0] + 0.5 * height
+    center_x = box[:, 1] + 0.5 * width
+
+    # gt box
+    gt_height = gt_box[:, 2] - gt_box[:, 0]
+    gt_width = gt_box[:, 3] - gt_box[:, 1]
+    gt_center_y = gt_box[:, 0] + 0.5 * gt_height
+    gt_center_x = gt_box[:, 1] + 0.5 * gt_width
+
+    # Compute the bbox refinement that the RPN should predict.
+    dy = (gt_center_y - center_y) / height
+    dx = (gt_center_x - center_x) / width
+    dh = tf.log(gt_height / height)
+    dw = tf.log(gt_width / width)
+
+    result = tf.stack([dy, dx, dh, dw], axis=1)
+
+    # Normalize
+    bbox_std_dev = tf.constant([0.1, 0.1, 0.2, 0.2], dtype=tf.float32)
+    result = result / bbox_std_dev
+
+    return result
+
+
+if __name__ == '__main__':
+    import os
+
+    os.environ["CUDA_VISIBLE_DEVICES"] = "2"  # 指定GPU
+    with tf.Session() as sess:
+        # boxes = gen_anchors_op([128, 256, 512], [[0.5, 1., 2]], [60, 40], 1, 1)
+        # result = sess.run(boxes)
+        # print(result.shape)
+        # print(result[0][0][0])
+        #
+        # re2 = generate_anchors([128, 256, 512], [0.5, 1., 2], [60, 40], 16, 1)
+        # print(re2.reshape([-1, 60, 40, 9, 4])[0][0][0])
+        a = tf.constant([
+            [0, 2, 3, 4],
+            [2, 3, 4, 5]
+        ])
+        b = tf.constant([
+            [4, 3, 4, 5]
+        ])
+        o = overlaps_op(a, b)
+        ro = sess.run(o)
+        print(ro)
+
+        a1 = tf.constant([
+            [[1, 2, 3, 4], [2, 3, 4, 5]],
+            [[0, 2, 3, 4], [2, 3, 4, 5]]
+        ])
+        print(a1.shape)
+        b1 = tf.constant([
+            [[2, 3, 4, 5], [4, 3, 4, 5]],
+            [[2, 3, 4, 5], [2, 3, 4, 5]]
+        ])
+        print(b1.shape)
+        o1 = batch_overlaps_op(a1, b1)
+        ro1 = sess.run(o1)
+        print(ro1)
+        print(ro1.shape)
 
 # [[ -84.  -40.   99.   55.]
 # [-176.  -88.  191.  103.]

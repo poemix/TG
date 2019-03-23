@@ -93,7 +93,8 @@ class Vgg19:
             value = initial_value
 
         if self.trainable:
-            var = tf.Variable(value, name=var_name)
+            var = tf.get_variable(name=var_name, initializer=value)
+            # var = tf.get_variable(value, name=var_name)
         else:
             var = tf.constant(value, dtype=tf.float32, name=var_name)
 

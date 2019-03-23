@@ -53,8 +53,8 @@ class TXTLoader(object):
                 self.n_sample = len(images_path)
                 names = tf.convert_to_tensor(images_path, tf.string)
                 images_path = tf.convert_to_tensor(list(map(lambda x: '{}{}'.format(root, x), images_path)), tf.string)
-                thumbnail_dims = tf.convert_to_tensor(np.array(list(thumbnail_dims)), tf.int64)
-                bboxes = tf.convert_to_tensor(np.array(list(bboxes)), tf.int64)
+                thumbnail_dims = tf.convert_to_tensor(np.array(list(thumbnail_dims)), tf.int32)
+                bboxes = tf.convert_to_tensor(np.array(list(bboxes)), tf.int32)
                 image_path, thumbnail_dim, ratio, bbox, name = tf.train.slice_input_producer(
                     [images_path, thumbnail_dims, ratios, bboxes, names],
                     shuffle=shuffle,
@@ -64,6 +64,8 @@ class TXTLoader(object):
 
                 image_value = tf.read_file(image_path)
                 image = tf.image.decode_jpeg(image_value, channels=3)
+
+                # padding image
                 shape = tf.shape(image)
                 h, w = shape[0], shape[1]
                 top_pad = (height - h) // 2
@@ -72,15 +74,17 @@ class TXTLoader(object):
                 right_pad = width - w - left_pad
                 padding = [(top_pad, bottom_pad), (left_pad, right_pad), (0, 0)]
                 image = tf.pad(image, padding, mode='constant', constant_values=0)
-                window = tf.convert_to_tensor([top_pad, left_pad, h + top_pad, w + left_pad])
-                image = image / 255
+
+                # norm image
                 image = tf.reshape(image, [height, width, 3])
-                shift = tf.cast(tf.convert_to_tensor([top_pad, left_pad, top_pad, left_pad]), tf.int64)
+                image = image / 255
+
+                window = tf.convert_to_tensor([top_pad, left_pad, h + top_pad, w + left_pad])
+
+                shift = tf.convert_to_tensor([top_pad, left_pad, top_pad, left_pad])
                 x1, y1, x2, y2 = bbox[0], bbox[1], bbox[2], bbox[3]
                 bbox = tf.stack([y1, x1, y2, x2])
                 gt_bbox = tf.add(bbox, shift)
-                bbox = tf.cast(bbox, tf.int32)
-                gt_bbox = tf.cast(gt_bbox, tf.int32)
                 meta = tf.stack([window[0], window[1], window[2], window[3], bbox[0], bbox[1], bbox[2], bbox[3], h, w])
 
                 if shuffle:
