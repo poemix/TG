@@ -349,7 +349,6 @@ def rpn_bbox_loss_op(target_bbox, rpn_match, rpn_bbox):
     rpn_bbox = tf.gather_nd(rpn_bbox, indices)
 
     target_bbox = tf.gather_nd(target_bbox, indices)
-    print(111, target_bbox)
 
     # # Trim target bounding box deltas to the same length as rpn_bbox.
     # batch_counts = tf.reduce_sum(tf.cast(tf.equal(rpn_match, 1), tf.int32), axis=1)  # batch_counts: [batch]
@@ -371,14 +370,18 @@ def rpn_class_loss_op(rpn_match, rpn_class_logits):
     """
     # Squeeze last dim to simplify
     rpn_match = tf.squeeze(rpn_match, -1)
+
     # Get anchor classes. Convert the -1/+1 match to 0/1 values.
     anchor_class = tf.cast(tf.equal(rpn_match, 1), tf.int32)
+
     # Positive and Negative anchors contribute to the loss,
     # but neutral anchors (match value = 0) don't.
     indices = tf.where(tf.not_equal(rpn_match, 0))
+
     # Pick rows that contribute to the loss and filter out the rest.
     rpn_class_logits = tf.gather_nd(rpn_class_logits, indices)
     anchor_class = tf.gather_nd(anchor_class, indices)  # anchor_class: [num_pos+num_neg]
+
     # Cross entropy loss
     loss = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=anchor_class, logits=rpn_class_logits)
     loss = tf.cond(tf.size(loss) > 0, lambda: tf.reduce_mean(loss), lambda: tf.constant(0.0))
@@ -474,6 +477,8 @@ def apply_box_deltas_op(boxes, deltas):
     x2 = x1 + width
     result = tf.stack([y1, x1, y2, x2], axis=1, name="apply_box_deltas_out")
 
+    return result
+
 
 def build_rpn_targets(anchors, gt_bboxes):
     """
@@ -547,28 +552,28 @@ if __name__ == '__main__':
         # print(re2.reshape([-1, 60, 40, 9, 4])[0][0][0])
         a = tf.constant([
             [0, 2, 3, 4],
-            [2, 3, 4, 5]
+            [1, 3, 4, 5]
         ])
         b = tf.constant([
-            [4, 3, 4, 5]
+            [0, 2, 3, 4]
         ])
         o = overlaps_op(a, b)
         ro = sess.run(o)
         print(ro)
 
         a1 = tf.constant([
-            [[1, 2, 3, 4], [2, 3, 4, 5]],
-            [[0, 2, 3, 4], [2, 3, 4, 5]]
+            [[1, 2, 3, 4], [1, 3, 4, 5]],
+            [[0, 2, 3, 4], [1, 3, 4, 5]]
         ])
         print(a1.shape)
         b1 = tf.constant([
-            [[2, 3, 4, 5], [4, 3, 4, 5]],
-            [[2, 3, 4, 5], [2, 3, 4, 5]]
+            [[1, 3, 4, 5]],
+            [[0, 2, 3, 4]]
         ])
         print(b1.shape)
         o1 = batch_overlaps_op(a1, b1)
         ro1 = sess.run(o1)
-        print(ro1)
+        print(ro1[1])
         print(ro1.shape)
 
 # [[ -84.  -40.   99.   55.]

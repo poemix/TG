@@ -121,7 +121,7 @@ def RPN(conv_features, aspect_ratio):
     conv_op_1 = conv2d(conv_features, 512, k_h=3, k_w=3, d_h=1, d_w=1, name="conv_op_1")
 
     # predict objectness-score (3 boxes per position)
-    w2, b2 = Gen_Adap_Weights(aspect_ratio, [1, 1, 512, params['n_b_boxes']*2], "ad_obj_scores")
+    w2, b2 = Gen_Adap_Weights(aspect_ratio, [1, 1, 512, params['n_b_boxes'] * 2], "ad_obj_scores")
     objectness_op = tf.nn.conv2d(conv_op_1, w2, strides=[1, 1, 1, 1], padding='SAME')
     objectness_op = tf.reshape(tf.nn.bias_add(objectness_op, b2), objectness_op.get_shape())
     o_shape = objectness_op.get_shape().as_list()
