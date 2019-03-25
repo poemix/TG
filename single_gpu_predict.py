@@ -62,7 +62,7 @@ pbboxes = clip_bbox_op(pbboxes, window)
 
 indices = tf.image.non_max_suppression(
     pbboxes, tf.reshape(scores, [-1]), 1,
-    0.5, name="rpn_non_max_suppression")
+    0.7, name="rpn_non_max_suppression")
 proposals = tf.gather(pbboxes, indices)
 
 # data reader
