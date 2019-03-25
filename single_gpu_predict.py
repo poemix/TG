@@ -48,6 +48,9 @@ deltas = deltas * tf.reshape(bbox_std_dev, [1, 1, 4])
 # 排序
 ix = tf.nn.top_k(scores, tf.shape(anchors)[1], sorted=True, name="top_anchors").indices
 ix = tf.reshape(ix, [-1])
+# scores = tf.batch_gather(scores, ix)
+# deltas = tf.batch_gather(deltas, ix)
+# anchors = tf.batch_gather(anchors)
 scores = tf.gather(tf.reshape(scores, [-1]), ix)
 deltas = tf.gather(tf.reshape(deltas, [-1, 4]), ix)
 anchors = tf.gather(tf.reshape(anchors, [-1, 4]), ix)
@@ -80,12 +83,15 @@ with tf.Session(config=config) as sess:
     saver = tf.train.Saver(max_to_keep=50)
     sess.run(tf.global_variables_initializer())
     saver.restore(sess, './models/restore_0_5000.ckpt')
+    batch_size = 2
+    images = np.empty([batch_size, height, width, 3], dtype=np.uint8)
 
     for index, (image_path, bbox, ratio, thumbnail_dim) in enumerate(zip(images_path, bboxes, ratios, thumbnail_dims)):
         ratio = np.array([ratio], dtype=np.float32)
         # read image file
         image = cv2.imread(image_path)
         h, w, c = image.shape
+        print(h, w)
 
         x1, y1, x2, y2 = bbox[0], bbox[1], bbox[2], bbox[3]
         bbox = np.array([y1, x1, y2, x2])
@@ -128,6 +134,7 @@ with tf.Session(config=config) as sess:
                 input_left_pad: left_pad
             }
         )
+        print(pred_bbox.shape, pred_bbox)
         now_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         print(now_time, pred_bbox.shape, pred_bbox)
         pred_bbox = np.reshape(pred_bbox, [-1])
@@ -142,3 +149,5 @@ with tf.Session(config=config) as sess:
 
         cv2.waitKey(0)
         cv2.destroyAllWindows()
+        # cv2.imwrite('./2.jpg', pad_image[top_pad:top_pad + h, left_pad:left_pad + w, :])
+        # break
